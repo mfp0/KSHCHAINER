@@ -1,0 +1,25 @@
+# Generated files
+*.db
+*.log
+__pycache__/
+*.pyc
+*.pyo
+
+# Test outputs
+test_export.json
+integration_test_export.json
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Personal files
+*.personal
+*.private
