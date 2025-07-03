@@ -1,0 +1,32 @@
+# KSH Script Dependency Analyzer Requirements
+# Using only Python standard library modules
+
+# FUNCTIONAL REQUIREMENTS:
+# 1. Scan KSH folder for .ksh and .sh files
+# 2. Scan CTL folder for .ctl files (SQL*Loader control files)
+# 3. Parse KSH scripts to find:
+#    - Script calls (pattern: xyz.ksh)
+#    - PL/SQL procedure calls (pattern: select schema.pk_xyz.procedure(params) from dual)
+#    - .ctl file references
+# 4. Build bidirectional dependency mapping (forward and backward lookups)
+# 5. Visualize dependencies in tkinter GUI
+# 6. Export results to various formats
+
+# PARSING PATTERNS:
+# - KSH script calls: xyz.ksh (also handle ./xyz.ksh, ksh xyz.ksh)
+# - PL/SQL calls: "select schema.package.procedure(params) from dual"
+# - CTL file references: references to .ctl files in SQL*Loader commands
+
+# STANDARD LIBRARY MODULES:
+# - tkinter (GUI framework with tree view, canvas for visualization)
+# - sqlite3 (local database for storing dependencies and metadata)
+# - re (regex for parsing KSH scripts and SQL patterns)
+# - os (file system operations and directory scanning)
+# - pathlib (modern path handling)
+# - json (configuration and data export)
+# - threading (background processing for large file scans)
+# - logging (error handling and debugging)
+# - tkinter.ttk (enhanced widgets)
+# - tkinter.filedialog (folder selection)
+
+# No external dependencies required - all functionality uses Python standard library

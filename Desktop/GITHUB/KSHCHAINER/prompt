@@ -1,0 +1,15 @@
+OK, at my workplace I have to map KSH scripts. I have over 2k 
+  sript to be analyzed, the ultimate goal is that I need to know 
+  out from these scripts whether it calls other KSH script/s (you
+   may have multiple level of calls so file1->file2->file3 ect). 
+  Also I need to be able to map any occurences of .ctl file these
+   are used by sqlload within ksh script (I have a separate 
+  folder with them). Whats more I need to be able to correlate 
+  perticular script with any call of pl/sql procedure which 
+  regular layout look select 
+  schema.pk_xyz.actual_procedure/functions(params). Before 
+  codding tell me what you understand and whats ur suggestion. I 
+  would like to be able also to ilustrate these dependencies. 
+  When it comes to dependecies itself, for any given ksh script, 
+  I need to be able to see, if it was called by other ksh script 
+  so we need forward looking and backwards looking algorithm
