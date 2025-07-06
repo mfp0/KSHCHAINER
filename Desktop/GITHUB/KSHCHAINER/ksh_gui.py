@@ -11,6 +11,9 @@ import os
 import json
 from typing import Dict, List
 import sqlite3
+import datetime
+import tempfile
+import subprocess
 from ksh_analyzer import KSHAnalyzer
 
 class KSHAnalyzerGUI:
@@ -39,6 +42,11 @@ class KSHAnalyzerGUI:
         self.drag_start_y = 0
         self.canvas_objects = {}
         self.element_connections = {}
+        
+        # Zoom tracking
+        self.zoom_factor = 1.0
+        self.min_zoom = 0.1
+        self.max_zoom = 5.0
         
         self.create_widgets()
         self.create_menu()
@@ -316,15 +324,26 @@ class KSHAnalyzerGUI:
         self.canvas_objects = {}  # Store canvas objects with their IDs
         self.element_connections = {}  # Store connections between elements
         
+        # Store current zoom factor
+        self.zoom_factor = 1.0
+        
         # Bind drag events
         self.canvas.bind("<Button-1>", self.on_canvas_click)
         self.canvas.bind("<B1-Motion>", self.on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_canvas_release)
         
-        # Mouse wheel zoom support
+        # Mouse wheel zoom support with cursor position
         self.canvas.bind("<MouseWheel>", self.on_mouse_wheel)  # Windows/Mac
         self.canvas.bind("<Button-4>", self.on_mouse_wheel)    # Linux scroll up
         self.canvas.bind("<Button-5>", self.on_mouse_wheel)    # Linux scroll down
+        
+        # Key bindings for zoom
+        self.canvas.bind("<Control-plus>", lambda e: self.zoom_in())
+        self.canvas.bind("<Control-minus>", lambda e: self.zoom_out())
+        self.canvas.bind("<Control-0>", lambda e: self.reset_zoom())
+        
+        # Focus the canvas to receive key events
+        self.canvas.focus_set()
         
         # Visualization controls
         vis_controls = ttk.Frame(vis_frame)
@@ -332,8 +351,13 @@ class KSHAnalyzerGUI:
         
         ttk.Button(vis_controls, text="🔍+ Zoom In", command=self.zoom_in).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(vis_controls, text="🔍- Zoom Out", command=self.zoom_out).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(vis_controls, text="🔄 Reset Zoom", command=self.reset_zoom).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(vis_controls, text="📐 Fit All", command=self.fit_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(vis_controls, text="💾 Save Image", command=self.save_visualization).pack(side=tk.LEFT, padx=(0, 5))
+        
+        # Add zoom level indicator
+        self.zoom_label = ttk.Label(vis_controls, text="Zoom: 100%")
+        self.zoom_label.pack(side=tk.LEFT, padx=(10, 0))
         
     def create_status_bar(self, parent):
         """Create status bar"""
@@ -519,8 +543,10 @@ class KSHAnalyzerGUI:
         chain = self.build_dependency_chain(script_name)
         
         if len(chain) > 2:  # If we have a chain
-            self.draw_dependency_chain(chain, script_name)
+            # Draw the main chain AND additional dependencies for complete cartography
+            self.draw_comprehensive_chain_view(chain, script_name, forward_deps, backward_deps)
         else:
+            # Draw star diagram with all dependency types
             self.draw_star_diagram(script_name, forward_deps, backward_deps)
         
         # Update scroll region
@@ -540,34 +566,34 @@ class KSHAnalyzerGUI:
             if not script_deps:
                 break
                 
-            # Prioritize CTL files, then take first unvisited dependency
+            # Prioritize script files to continue the chain, then CTL files
             next_script = None
             
-            # First, look for CTL files
+            # First, look for script dependencies to continue the chain
+            # Avoid common utility scripts in favor of more specific ones
+            common_scripts = ['config.ksh', 'utils.ksh', 'notify.ksh', 'common.ksh']
+            
+            # First try non-common scripts
             for dep in script_deps:
-                if dep['target'] not in visited and dep['type'] == 'ctl':
+                if (dep['target'] not in visited and 
+                    dep['type'] == 'script' and 
+                    dep['target'] not in common_scripts):
                     next_script = dep['target']
                     break
             
-            # If no CTL files, prioritize non-common scripts, then take first script dependency
+            # If no specific scripts, take any script dependency
             if not next_script:
-                # Avoid common utility scripts in favor of more specific ones
-                common_scripts = ['config.ksh', 'utils.ksh', 'notify.ksh', 'common.ksh']
-                
-                # First try non-common scripts
                 for dep in script_deps:
-                    if (dep['target'] not in visited and 
-                        dep['type'] == 'script' and 
-                        dep['target'] not in common_scripts):
+                    if dep['target'] not in visited and dep['type'] == 'script':
                         next_script = dep['target']
                         break
-                
-                # If no specific scripts, take any script dependency
-                if not next_script:
-                    for dep in script_deps:
-                        if dep['target'] not in visited and dep['type'] == 'script':
-                            next_script = dep['target']
-                            break
+            
+            # Only if no scripts found, look for CTL files (but these usually end the chain)
+            if not next_script:
+                for dep in script_deps:
+                    if dep['target'] not in visited and dep['type'] == 'ctl':
+                        next_script = dep['target']
+                        break
             
             if not next_script:
                 break
@@ -751,6 +777,182 @@ class KSHAnalyzerGUI:
         # Store all elements for drag operations
         self.canvas_objects.update(elements)
     
+    def draw_comprehensive_chain_view(self, chain, selected_script, forward_deps, backward_deps):
+        """Draw comprehensive view showing both chain and additional dependencies"""
+        # First draw the main chain
+        self.draw_dependency_chain(chain, selected_script)
+        
+        # Then add additional dependencies that aren't part of the main chain
+        self.add_additional_dependencies_to_chain(selected_script, forward_deps, backward_deps, chain)
+    
+    def add_additional_dependencies_to_chain(self, script_name, forward_deps, backward_deps, chain):
+        """Add CTL files and PL/SQL procedures to the chain visualization"""
+        # Find the script in the chain to get its position
+        script_index = chain.index(script_name) if script_name in chain else -1
+        if script_index == -1:
+            return
+        
+        # Get the position of the selected script from existing chain visualization
+        script_tag = f"group_{script_index}"
+        if script_tag not in self.canvas_objects:
+            return
+        
+        script_elem = self.canvas_objects[script_tag]
+        center_x = script_elem['center_x']
+        center_y = script_elem['center_y']
+        
+        additional_elements = {}
+        
+        # Add forward dependencies (CTL and PL/SQL) below the chain
+        forward_non_script_deps = [dep for dep in forward_deps if dep['type'] in ['ctl', 'plsql'] or 
+                                  (dep['type'] == 'script' and dep['target'] not in chain)]
+        
+        for i, dep in enumerate(forward_non_script_deps[:8]):  # Limit for visibility
+            x = center_x + (i - len(forward_non_script_deps)//2) * 120  # Spread horizontally
+            y = center_y + 120  # Below the main chain
+            
+            # Determine color and display text based on type
+            if dep['type'] == 'ctl':
+                color = 'lightyellow'
+                outline = 'orange'
+                display_text = dep['target']
+                icon = '📄'
+            elif dep['type'] == 'plsql':
+                color = 'lightcoral'
+                outline = 'darkred'
+                # Format PL/SQL procedure name
+                schema = dep.get('schema', '')
+                package = dep.get('package', '')
+                procedure = dep['target']
+                if schema and package:
+                    display_text = f"{schema}.{package}.{procedure}"
+                elif package:
+                    display_text = f"{package}.{procedure}"
+                else:
+                    display_text = procedure
+                # Truncate if too long
+                if len(display_text) > 25:
+                    display_text = display_text[:22] + "..."
+                icon = '⚡'
+            else:  # script not in chain
+                color = 'lightgreen'
+                outline = 'darkgreen'
+                display_text = dep['target']
+                icon = '📜'
+            
+            # Calculate text dimensions
+            full_text = f"{icon} {display_text}"
+            text_width, text_height = self.calculate_text_dimensions(full_text, ('Arial', 8))
+            box_width = max(text_width + 20, 100)
+            box_height = max(text_height + 10, 30)
+            
+            # Create draggable box
+            group_tag = f"group_additional_forward_{i}"
+            rect = self.canvas.create_rectangle(
+                x - box_width//2, y - box_height//2,
+                x + box_width//2, y + box_height//2,
+                fill=color, outline=outline, width=2,
+                tags=('draggable', 'rect', group_tag)
+            )
+            
+            text = self.canvas.create_text(
+                x, y, text=full_text, font=('Arial', 8),
+                tags=('draggable', 'text', group_tag)
+            )
+            
+            # Store element info
+            additional_elements[group_tag] = {
+                'rect': rect,
+                'text': text,
+                'center_x': x,
+                'center_y': y,
+                'box_width': box_width,
+                'box_height': box_height,
+                'arrows_out': [],
+                'arrows_in': []
+            }
+            
+            # Create arrow from main script to this dependency
+            arrow = self.canvas.create_line(
+                center_x, center_y + script_elem['box_height']//2,
+                x, y - box_height//2,
+                arrow=tk.LAST, fill=outline, width=2,
+                tags=('arrow', f'additional_forward_arrow_{i}')
+            )
+            
+            # Store arrow connection
+            self.canvas_objects[script_tag]['arrows_out'].append(arrow)
+            additional_elements[group_tag]['arrows_in'].append(arrow)
+            
+            self.element_connections[arrow] = {
+                'source': script_tag,
+                'target': group_tag,
+                'type': 'additional_forward'
+            }
+        
+        # Add backward dependencies (scripts not in chain) above the chain
+        backward_non_script_deps = [dep for dep in backward_deps if dep['type'] == 'script' and dep['source'] not in chain]
+        
+        for i, dep in enumerate(backward_non_script_deps[:5]):  # Limit for visibility
+            x = center_x + (i - len(backward_non_script_deps)//2) * 120  # Spread horizontally
+            y = center_y - 120  # Above the main chain
+            
+            color = 'lightgray'
+            outline = 'black'
+            display_text = f"📜 {dep['source']}"
+            
+            # Calculate text dimensions
+            text_width, text_height = self.calculate_text_dimensions(display_text, ('Arial', 8))
+            box_width = max(text_width + 20, 100)
+            box_height = max(text_height + 10, 30)
+            
+            # Create draggable box
+            group_tag = f"group_additional_backward_{i}"
+            rect = self.canvas.create_rectangle(
+                x - box_width//2, y - box_height//2,
+                x + box_width//2, y + box_height//2,
+                fill=color, outline=outline, width=2,
+                tags=('draggable', 'rect', group_tag)
+            )
+            
+            text = self.canvas.create_text(
+                x, y, text=display_text, font=('Arial', 8),
+                tags=('draggable', 'text', group_tag)
+            )
+            
+            # Store element info
+            additional_elements[group_tag] = {
+                'rect': rect,
+                'text': text,
+                'center_x': x,
+                'center_y': y,
+                'box_width': box_width,
+                'box_height': box_height,
+                'arrows_out': [],
+                'arrows_in': []
+            }
+            
+            # Create arrow from this dependency to main script
+            arrow = self.canvas.create_line(
+                x, y + box_height//2,
+                center_x, center_y - script_elem['box_height']//2,
+                arrow=tk.LAST, fill=outline, width=2,
+                tags=('arrow', f'additional_backward_arrow_{i}')
+            )
+            
+            # Store arrow connection
+            additional_elements[group_tag]['arrows_out'].append(arrow)
+            self.canvas_objects[script_tag]['arrows_in'].append(arrow)
+            
+            self.element_connections[arrow] = {
+                'source': group_tag,
+                'target': script_tag,
+                'type': 'additional_backward'
+            }
+        
+        # Update the canvas objects with additional elements
+        self.canvas_objects.update(additional_elements)
+    
     def calculate_text_dimensions(self, text, font):
         """Calculate text dimensions for proper rectangle sizing"""
         try:
@@ -809,25 +1011,40 @@ class KSHAnalyzerGUI:
             'arrows_in': []
         }
         
-        # Draw forward dependencies (to the right)
-        for i, dep in enumerate(forward_deps[:5]):  # Limit to 5 for visibility
+        # Draw forward dependencies (to the right) - include ALL types for complete cartography
+        for i, dep in enumerate(forward_deps[:8]):  # Increased limit for more comprehensive view
             x = center_x + 350  # Increased distance to accommodate larger boxes
             y = center_y + (i - 2) * 80  # Increased vertical spacing
             
-            # Color based on type
+            # Color and formatting based on type
             if dep['type'] == 'script':
                 color = 'lightgreen'
                 outline = 'darkgreen'
+                display_text = f"📜 {dep['target']}"
             elif dep['type'] == 'ctl':
                 color = 'lightyellow'
                 outline = 'orange'
+                display_text = f"📄 {dep['target']}"
             else:  # plsql
                 color = 'lightcoral'
                 outline = 'darkred'
+                # Format PL/SQL procedure name
+                schema = dep.get('schema', '')
+                package = dep.get('package', '')
+                procedure = dep['target']
+                if schema and package:
+                    proc_name = f"{schema}.{package}.{procedure}"
+                elif package:
+                    proc_name = f"{package}.{procedure}"
+                else:
+                    proc_name = procedure
+                # Truncate if too long
+                if len(proc_name) > 30:
+                    proc_name = proc_name[:27] + "..."
+                display_text = f"⚡ {proc_name}"
             
-            # Calculate text dimensions for auto-sizing (no truncation)
-            target = dep['target']
-            target_text_width, target_text_height = self.calculate_text_dimensions(target, ('Arial', 8))
+            # Calculate text dimensions for auto-sizing
+            target_text_width, target_text_height = self.calculate_text_dimensions(display_text, ('Arial', 8))
             target_box_width = max(target_text_width + 20, 100)
             target_box_height = max(target_text_height + 10, 30)
             
@@ -840,9 +1057,9 @@ class KSHAnalyzerGUI:
                 tags=('draggable', 'rect', group_tag)
             )
             
-            # Create draggable text (no truncation)
+            # Create draggable text with icon and formatting
             text = self.canvas.create_text(
-                x, y, text=target, font=('Arial', 8),
+                x, y, text=display_text, font=('Arial', 8),
                 tags=('draggable', 'text', group_tag)
             )
             
@@ -877,13 +1094,16 @@ class KSHAnalyzerGUI:
             }
         
         # Draw backward dependencies (to the left)
-        for i, dep in enumerate(backward_deps[:5]):  # Limit to 5 for visibility
+        for i, dep in enumerate(backward_deps[:8]):  # Increased limit for more comprehensive view
             x = center_x - 350  # Increased distance to accommodate larger boxes
             y = center_y + (i - 2) * 80  # Increased vertical spacing
             
-            # Calculate text dimensions for auto-sizing (no truncation)
+            # Format source with icon
             source = dep['source']
-            source_text_width, source_text_height = self.calculate_text_dimensions(source, ('Arial', 8))
+            display_text = f"📜 {source}"
+            
+            # Calculate text dimensions for auto-sizing
+            source_text_width, source_text_height = self.calculate_text_dimensions(display_text, ('Arial', 8))
             source_box_width = max(source_text_width + 20, 100)
             source_box_height = max(source_text_height + 10, 30)
             
@@ -896,9 +1116,9 @@ class KSHAnalyzerGUI:
                 tags=('draggable', 'rect', group_tag)
             )
             
-            # Create draggable text (no truncation)
+            # Create draggable text with icon
             text = self.canvas.create_text(
-                x, y, text=source, font=('Arial', 8),
+                x, y, text=display_text, font=('Arial', 8),
                 tags=('draggable', 'text', group_tag)
             )
             
@@ -974,28 +1194,49 @@ class KSHAnalyzerGUI:
             
     def zoom_in(self):
         """Zoom in visualization"""
-        self._zoom_canvas(1.2)
+        if self.zoom_factor < self.max_zoom:
+            self._zoom_canvas(1.2)
         
     def zoom_out(self):
         """Zoom out visualization"""
-        self._zoom_canvas(0.8)
+        if self.zoom_factor > self.min_zoom:
+            self._zoom_canvas(0.8)
+    
+    def reset_zoom(self):
+        """Reset zoom to 100%"""
+        if self.zoom_factor != 1.0:
+            self._zoom_canvas(1.0 / self.zoom_factor)
         
     def _zoom_canvas(self, scale_factor):
         """Zoom canvas and update arrow connections"""
-        # Scale all canvas items
-        self.canvas.scale("all", 0, 0, scale_factor, scale_factor)
+        # Update zoom factor
+        self.zoom_factor *= scale_factor
+        
+        # Get canvas center for zoom origin
+        canvas_width = self.canvas.winfo_width()
+        canvas_height = self.canvas.winfo_height()
+        center_x = canvas_width / 2
+        center_y = canvas_height / 2
+        
+        # Scale all canvas items from center
+        self.canvas.scale("all", center_x, center_y, scale_factor, scale_factor)
         
         # Update canvas object positions after scaling
         for group_tag, obj_info in self.canvas_objects.items():
             if 'center_x' in obj_info and 'center_y' in obj_info:
-                obj_info['center_x'] *= scale_factor
-                obj_info['center_y'] *= scale_factor
+                # Scale positions relative to center
+                obj_info['center_x'] = center_x + (obj_info['center_x'] - center_x) * scale_factor
+                obj_info['center_y'] = center_y + (obj_info['center_y'] - center_y) * scale_factor
                 if 'box_width' in obj_info and 'box_height' in obj_info:
                     obj_info['box_width'] *= scale_factor
                     obj_info['box_height'] *= scale_factor
         
         # Update scroll region
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        
+        # Update zoom label
+        zoom_percent = int(self.zoom_factor * 100)
+        self.zoom_label.config(text=f"Zoom: {zoom_percent}%")
         
         # Force arrow updates by updating all connections
         self._update_all_arrows()
@@ -1023,19 +1264,282 @@ class KSHAnalyzerGUI:
                 self.canvas.coords(arrow_id, x1, y1, x2, y2)
     
     def on_mouse_wheel(self, event):
-        """Handle mouse wheel zoom"""
+        """Handle mouse wheel zoom centered on cursor position"""
+        # Check zoom limits
         if event.delta > 0 or event.num == 4:  # Zoom in
-            self._zoom_canvas(1.1)
+            if self.zoom_factor >= self.max_zoom:
+                return
+            scale_factor = 1.1
         else:  # Zoom out
-            self._zoom_canvas(0.9)
+            if self.zoom_factor <= self.min_zoom:
+                return
+            scale_factor = 0.9
+        
+        # Get mouse position in canvas coordinates
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
+        
+        # Update zoom factor
+        self.zoom_factor *= scale_factor
+        
+        # Scale all canvas items from mouse position
+        self.canvas.scale("all", canvas_x, canvas_y, scale_factor, scale_factor)
+        
+        # Update canvas object positions after scaling
+        for group_tag, obj_info in self.canvas_objects.items():
+            if 'center_x' in obj_info and 'center_y' in obj_info:
+                # Scale positions relative to mouse position
+                obj_info['center_x'] = canvas_x + (obj_info['center_x'] - canvas_x) * scale_factor
+                obj_info['center_y'] = canvas_y + (obj_info['center_y'] - canvas_y) * scale_factor
+                if 'box_width' in obj_info and 'box_height' in obj_info:
+                    obj_info['box_width'] *= scale_factor
+                    obj_info['box_height'] *= scale_factor
+        
+        # Update scroll region
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        
+        # Update zoom label
+        zoom_percent = int(self.zoom_factor * 100)
+        self.zoom_label.config(text=f"Zoom: {zoom_percent}%")
+        
+        # Force arrow updates
+        self._update_all_arrows()
         
     def fit_all(self):
         """Fit all items in visualization"""
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         
     def save_visualization(self):
-        """Save visualization as image"""
-        messagebox.showinfo("Save Visualization", "Visualization save functionality will be implemented")
+        """Save visualization as image using built-in Python libraries"""
+        # Check if there's anything to save
+        if not self.canvas_objects:
+            messagebox.showwarning("No Visualization", "No visualization to save. Please select a script first.")
+            return
+        
+        # Get save location and format
+        filename = filedialog.asksaveasfilename(
+            title="Save Visualization",
+            defaultextension=".ps",
+            filetypes=[
+                ("PostScript files", "*.ps"),
+                ("Text representation", "*.txt"),
+                ("All files", "*.*")
+            ]
+        )
+        
+        if not filename:
+            return
+        
+        try:
+            # Determine format from extension
+            file_ext = os.path.splitext(filename)[1].lower()
+            
+            if file_ext == '.ps':
+                self._save_as_postscript(filename)
+            elif file_ext == '.txt':
+                self._save_as_text(filename)
+            else:
+                # Default to PostScript
+                self._save_as_postscript(filename)
+            
+            messagebox.showinfo("Success", f"Visualization saved to {filename}")
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to save visualization: {e}")
+    
+    def _save_as_postscript(self, filename):
+        """Save canvas as PostScript file with enhanced formatting"""
+        # Get the bounding box of all items
+        bbox = self.canvas.bbox("all")
+        if not bbox:
+            raise ValueError("No items to save")
+        
+        # Add some padding
+        padding = 30
+        x1, y1, x2, y2 = bbox
+        x1 -= padding
+        y1 -= padding
+        x2 += padding
+        y2 += padding
+        
+        # Calculate page size (limit to reasonable dimensions)
+        width = x2 - x1
+        height = y2 - y1
+        max_size = 800  # Maximum dimension
+        
+        if width > max_size or height > max_size:
+            scale = max_size / max(width, height)
+            width *= scale
+            height *= scale
+        
+        # Save as PostScript with enhanced settings
+        self.canvas.postscript(
+            file=filename,
+            x=x1, y=y1,
+            width=x2-x1, height=y2-y1,
+            pagewidth=width, pageheight=height,
+            colormode='color',
+            pageanchor='nw'
+        )
+        
+        # Add metadata comment to the PostScript file
+        try:
+            with open(filename, 'r') as f:
+                content = f.read()
+            
+            # Add custom header with metadata
+            header = f"""%%!PS-Adobe-3.0 EPSF-3.0
+%%Creator: KSH Script Dependency Analyzer v1.2
+%%Title: Dependency Visualization
+%%CreationDate: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+%%DocumentData: Clean7Bit
+%%LanguageLevel: 2
+%%Pages: 1
+%%BoundingBox: 0 0 {int(width)} {int(height)}
+%%EndComments
+
+"""
+            
+            # Find the original PS header and replace it
+            if content.startswith('%!PS-Adobe'):
+                # Find end of original header
+                end_header = content.find('%%EndComments')
+                if end_header > 0:
+                    content = header + content[end_header + len('%%EndComments'):]
+                else:
+                    content = header + content[content.find('\n') + 1:]
+            else:
+                content = header + content
+            
+            with open(filename, 'w') as f:
+                f.write(content)
+                
+        except Exception:
+            # If metadata addition fails, the basic PostScript file is still valid
+            pass
+    
+    def _save_as_text(self, filename):
+        """Save visualization as text representation"""
+        # Create text representation of the dependency diagram
+        text_content = []
+        text_content.append("KSH Script Dependency Visualization")
+        text_content.append("=" * 50)
+        text_content.append(f"Generated: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        text_content.append(f"Total elements: {len(self.canvas_objects)}")
+        text_content.append("")
+        
+        # Add current script info if available
+        if hasattr(self, 'current_script') and self.current_script.get():
+            text_content.append(f"Selected Script: {self.current_script.get()}")
+            text_content.append("")
+        
+        # Group elements by type
+        elements_by_type = {
+            'scripts': [],
+            'ctl_files': [],
+            'plsql': [],
+            'other': []
+        }
+        
+        for group_tag, element in self.canvas_objects.items():
+            # Get the text content of the element
+            if 'text' in element:
+                text_items = self.canvas.find_withtag(group_tag)
+                element_text = ""
+                for item in text_items:
+                    item_type = self.canvas.type(item)
+                    if item_type == "text":
+                        element_text = self.canvas.itemcget(item, "text")
+                        break
+                
+                # Categorize based on content or group tag
+                if 'script' in group_tag.lower() or element_text.endswith('.ksh') or element_text.endswith('.sh'):
+                    elements_by_type['scripts'].append(element_text)
+                elif 'ctl' in group_tag.lower() or element_text.endswith('.ctl'):
+                    elements_by_type['ctl_files'].append(element_text)
+                elif '⚡' in element_text or 'plsql' in group_tag.lower():
+                    elements_by_type['plsql'].append(element_text)
+                else:
+                    elements_by_type['other'].append(element_text)
+        
+        # Add categorized elements to text
+        if elements_by_type['scripts']:
+            text_content.append("SCRIPTS:")
+            text_content.append("-" * 20)
+            for script in sorted(elements_by_type['scripts']):
+                text_content.append(f"  📜 {script}")
+            text_content.append("")
+        
+        if elements_by_type['ctl_files']:
+            text_content.append("CTL FILES:")
+            text_content.append("-" * 20)
+            for ctl in sorted(elements_by_type['ctl_files']):
+                text_content.append(f"  📄 {ctl}")
+            text_content.append("")
+        
+        if elements_by_type['plsql']:
+            text_content.append("PL/SQL PROCEDURES:")
+            text_content.append("-" * 20)
+            for plsql in sorted(elements_by_type['plsql']):
+                text_content.append(f"  ⚡ {plsql}")
+            text_content.append("")
+        
+        if elements_by_type['other']:
+            text_content.append("OTHER ELEMENTS:")
+            text_content.append("-" * 20)
+            for other in sorted(elements_by_type['other']):
+                text_content.append(f"  🔹 {other}")
+            text_content.append("")
+        
+        # Add connection information
+        if self.element_connections:
+            text_content.append("CONNECTIONS:")
+            text_content.append("-" * 20)
+            
+            connections_by_type = {}
+            for arrow_id, conn_info in self.element_connections.items():
+                conn_type = conn_info.get('type', 'unknown')
+                if conn_type not in connections_by_type:
+                    connections_by_type[conn_type] = []
+                
+                source_tag = conn_info.get('source', 'unknown')
+                target_tag = conn_info.get('target', 'unknown')
+                
+                # Get readable names from canvas objects
+                source_name = self._get_element_name(source_tag)
+                target_name = self._get_element_name(target_tag)
+                
+                connections_by_type[conn_type].append(f"{source_name} → {target_name}")
+            
+            for conn_type, connections in connections_by_type.items():
+                if connections:
+                    text_content.append(f"  {conn_type.upper()} connections:")
+                    for conn in sorted(connections):
+                        text_content.append(f"    {conn}")
+                    text_content.append("")
+        
+        # Add zoom and view information
+        text_content.append("VIEW INFORMATION:")
+        text_content.append("-" * 20)
+        text_content.append(f"Current zoom: {int(self.zoom_factor * 100)}%")
+        if bbox := self.canvas.bbox("all"):
+            text_content.append(f"Canvas bounds: {bbox[0]},{bbox[1]} to {bbox[2]},{bbox[3]}")
+        text_content.append("")
+        
+        # Write to file
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(text_content))
+    
+    def _get_element_name(self, group_tag):
+        """Get readable name for an element from its group tag"""
+        if group_tag in self.canvas_objects:
+            element = self.canvas_objects[group_tag]
+            if 'text' in element:
+                text_items = self.canvas.find_withtag(group_tag)
+                for item in text_items:
+                    if self.canvas.type(item) == "text":
+                        return self.canvas.itemcget(item, "text")
+        return group_tag
         
     def export_dependencies(self):
         """Export dependencies to file"""
@@ -1069,8 +1573,13 @@ class KSHAnalyzerGUI:
         for item in self.backward_tree.get_children():
             self.backward_tree.delete(item)
             
-        # Clear canvas
+        # Clear canvas and reset zoom
         self.canvas.delete("all")
+        self.canvas_objects.clear()
+        self.element_connections.clear()
+        self.zoom_factor = 1.0
+        if hasattr(self, 'zoom_label'):
+            self.zoom_label.config(text="Zoom: 100%")
         
         # Reset status
         self.status_label.config(text="Ready")
@@ -1217,26 +1726,43 @@ Database File: {self.analyzer.db_path}"""
         self.global_plsql_status_label.config(text="Use PL/SQL search box above to find procedures across all scripts")
     
     def on_canvas_click(self, event):
-        """Handle canvas click for dragging"""
-        # Find the item under the cursor
-        item = self.canvas.find_closest(event.x, event.y)[0]
+        """Handle canvas click for dragging with improved hit detection"""
+        # Convert screen coordinates to canvas coordinates
+        canvas_x = self.canvas.canvasx(event.x)
+        canvas_y = self.canvas.canvasy(event.y)
         
-        # Check if it's a draggable item (rectangle or text)
-        tags = self.canvas.gettags(item)
-        if 'draggable' in tags:
-            self.dragging = item
-            self.drag_start_x = event.x
-            self.drag_start_y = event.y
+        # Find all items under the cursor (not just the closest)
+        items = self.canvas.find_overlapping(canvas_x - 5, canvas_y - 5, canvas_x + 5, canvas_y + 5)
+        
+        # Find the topmost draggable item
+        draggable_item = None
+        for item in reversed(items):  # Check topmost items first
+            tags = self.canvas.gettags(item)
+            if 'draggable' in tags:
+                draggable_item = item
+                break
+        
+        if draggable_item:
+            self.dragging = draggable_item
+            self.drag_start_x = canvas_x
+            self.drag_start_y = canvas_y
             
             # Change cursor to indicate dragging
             self.canvas.config(cursor="hand2")
+        else:
+            # Reset cursor if clicking empty space
+            self.canvas.config(cursor="")
     
     def on_canvas_drag(self, event):
         """Handle canvas dragging with arrow updates"""
         if self.dragging:
+            # Convert screen coordinates to canvas coordinates
+            canvas_x = self.canvas.canvasx(event.x)
+            canvas_y = self.canvas.canvasy(event.y)
+            
             # Calculate movement
-            dx = event.x - self.drag_start_x
-            dy = event.y - self.drag_start_y
+            dx = canvas_x - self.drag_start_x
+            dy = canvas_y - self.drag_start_y
             
             # Move the item
             self.canvas.move(self.dragging, dx, dy)
@@ -1265,8 +1791,8 @@ Database File: {self.analyzer.db_path}"""
                     self.update_connected_arrows(group_tag)
             
             # Update start position for next drag
-            self.drag_start_x = event.x
-            self.drag_start_y = event.y
+            self.drag_start_x = canvas_x
+            self.drag_start_y = canvas_y
             
             # Update scroll region
             self.canvas.configure(scrollregion=self.canvas.bbox("all"))
@@ -1292,6 +1818,18 @@ Database File: {self.analyzer.db_path}"""
                     y1 = source_elem['center_y']
                     x2 = target_elem['center_x'] - target_elem['box_width']//2
                     y2 = target_elem['center_y']
+                elif conn['type'] == 'additional_forward':
+                    # For additional forward arrows (vertical down)
+                    x1 = source_elem['center_x']
+                    y1 = source_elem['center_y'] + source_elem['box_height']//2
+                    x2 = target_elem['center_x']
+                    y2 = target_elem['center_y'] - target_elem['box_height']//2
+                elif conn['type'] == 'additional_backward':
+                    # For additional backward arrows (vertical up)
+                    x1 = source_elem['center_x']
+                    y1 = source_elem['center_y'] + source_elem['box_height']//2
+                    x2 = target_elem['center_x']
+                    y2 = target_elem['center_y'] - target_elem['box_height']//2
                 else:
                     # For star diagram arrows using actual box dimensions
                     if conn['type'] == 'forward':
@@ -1322,6 +1860,18 @@ Database File: {self.analyzer.db_path}"""
                     y1 = source_elem['center_y']
                     x2 = target_elem['center_x'] - target_elem['box_width']//2
                     y2 = target_elem['center_y']
+                elif conn['type'] == 'additional_forward':
+                    # For additional forward arrows (vertical down)
+                    x1 = source_elem['center_x']
+                    y1 = source_elem['center_y'] + source_elem['box_height']//2
+                    x2 = target_elem['center_x']
+                    y2 = target_elem['center_y'] - target_elem['box_height']//2
+                elif conn['type'] == 'additional_backward':
+                    # For additional backward arrows (vertical up)
+                    x1 = source_elem['center_x']
+                    y1 = source_elem['center_y'] + source_elem['box_height']//2
+                    x2 = target_elem['center_x']
+                    y2 = target_elem['center_y'] - target_elem['box_height']//2
                 else:
                     # For star diagram arrows using actual box dimensions
                     if conn['type'] == 'forward':
@@ -1348,7 +1898,7 @@ Database File: {self.analyzer.db_path}"""
         """Show about dialog"""
         about_text = """KSH Script Dependency Analyzer
         
-Version: 1.1
+Version: 1.2
 Author: Assistant
         
 This application analyzes KSH/SH scripts to identify:
@@ -1358,10 +1908,19 @@ This application analyzes KSH/SH scripts to identify:
 
 Features:
 - Bidirectional dependency mapping
-- Visual dependency graphs
+- Visual dependency graphs with improved dragging
+- Mouse wheel zoom and cursor-centered zooming
+- Image export (PostScript and text formats)
 - PL/SQL procedure search
 - Export functionality
-- Search and filter capabilities"""
+- Search and filter capabilities
+
+Controls:
+- Mouse wheel: Zoom in/out at cursor position
+- Drag: Move visualization elements
+- Ctrl+Plus/Minus: Zoom in/out
+- Ctrl+0: Reset zoom
+- Save Image: Export visualization to PostScript or text"""
         
         messagebox.showinfo("About", about_text)
     

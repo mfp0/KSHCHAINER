@@ -27,10 +27,10 @@ class KSHAnalyzer:
         self.patterns = {
             'script_call': [
                 r'(?:^|\s)(\w+\.(?:ksh|sh))(?:\s|$)',  # Direct script calls
-                r'(?:^|\s)\.\/(\w+\.(?:ksh|sh))(?:\s|$)',  # Relative path calls
-                r'(?:^|\s)ksh\s+(\w+\.(?:ksh|sh))(?:\s|$)',  # ksh command calls
-                r'(?:^|\s)\.\s+(\w+\.(?:ksh|sh))(?:\s|$)',  # Source with dot
-                r'(?:^|\s)source\s+(\w+\.(?:ksh|sh))(?:\s|$)',  # Source command
+                r'(?:^|\s)\.\/([/\w]+\.(?:ksh|sh))(?:\s|$)',  # Relative path calls with nested directories
+                r'(?:^|\s)ksh\s+([/\w]+\.(?:ksh|sh))(?:\s|$)',  # ksh command calls with paths
+                r'(?:^|\s)\.\s+([/\w]+\.(?:ksh|sh))(?:\s|$)',  # Source with dot and paths
+                r'(?:^|\s)source\s+([/\w]+\.(?:ksh|sh))(?:\s|$)',  # Source command with paths
             ],
             'ctl_file': [
                 r'control\s*=\s*(\w+\.ctl)',  # SQL*Loader control file
@@ -144,13 +144,15 @@ class KSHAnalyzer:
                 if not line_clean:
                     continue
                     
-                # Extract script calls - use set to prevent duplicates per line
+                # Extract script calls - use set to prevent duplicates per line (normalized)
                 found_scripts = set()
                 for pattern in self.patterns['script_call']:
                     matches = re.findall(pattern, line_clean, re.IGNORECASE)
                     for match in matches:
-                        if match not in found_scripts:
-                            found_scripts.add(match)
+                        # Normalize the script name to prevent duplicates like "./script.ksh" and "script.ksh"
+                        normalized_match = self.normalize_script_name(match)
+                        if normalized_match not in found_scripts:
+                            found_scripts.add(normalized_match)
                             dependencies['scripts'].append((
                                 filename, match, line_num, line_clean, is_commented
                             ))
@@ -245,13 +247,17 @@ class KSHAnalyzer:
                 deps = self.extract_dependencies_from_file(filepath)
                 results['dependencies'][os.path.basename(filepath)] = deps
                 
-                # Store script dependencies
+                # Store script dependencies with normalized target names to prevent duplicates
                 for dep in deps['scripts']:
+                    # Always normalize the target script name before storage
+                    normalized_target = self.normalize_script_name(dep[1])
+                    
+                    # Insert the dependency with normalized target name
                     cursor.execute('''
-                        INSERT INTO dependencies 
+                        INSERT OR IGNORE INTO dependencies 
                         (source_script, target_script, dependency_type, line_number, context, is_commented)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    ''', (dep[0], dep[1], 'script', dep[2], dep[3], dep[4]))
+                    ''', (dep[0], normalized_target, 'script', dep[2], dep[3], dep[4]))
                 
                 # Store CTL file dependencies
                 for dep in deps['ctl_files']:
@@ -363,17 +369,34 @@ class KSHAnalyzer:
         conn.close()
         return deps
     
+    def normalize_script_name(self, script_name: str) -> str:
+        """Normalize script name by removing path prefixes like './' """
+        import os
+        # Remove common path prefixes
+        normalized = script_name
+        if normalized.startswith('./'):
+            normalized = normalized[2:]
+        elif normalized.startswith('.\\'):
+            normalized = normalized[2:]
+        # Get just the filename if it's a full path
+        normalized = os.path.basename(normalized)
+        return normalized
+    
     def get_backward_dependencies(self, script_name: str) -> List[Dict]:
         """Get what calls the script (backward dependencies)"""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        # Normalize the script name
+        normalized_script = self.normalize_script_name(script_name)
+        
+        # Search for the normalized script name (since we now store normalized names)
         cursor.execute('''
             SELECT source_script, dependency_type, line_number, context, is_commented
             FROM dependencies
             WHERE target_script = ? AND is_commented = 0
             ORDER BY source_script, line_number
-        ''', (script_name,))
+        ''', (normalized_script,))
         
         deps = []
         for row in cursor.fetchall():
