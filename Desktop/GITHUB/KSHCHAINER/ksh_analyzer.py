@@ -93,6 +93,15 @@ class KSHAnalyzer:
             )
         ''')
         
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_settings (
+                id INTEGER PRIMARY KEY,
+                setting_name TEXT UNIQUE,
+                setting_value TEXT,
+                last_updated TEXT
+            )
+        ''')
+        
         conn.commit()
         conn.close()
         
@@ -135,27 +144,35 @@ class KSHAnalyzer:
                 if not line_clean:
                     continue
                     
-                # Extract script calls
+                # Extract script calls - use set to prevent duplicates per line
+                found_scripts = set()
                 for pattern in self.patterns['script_call']:
                     matches = re.findall(pattern, line_clean, re.IGNORECASE)
                     for match in matches:
-                        dependencies['scripts'].append((
-                            filename, match, line_num, line_clean, is_commented
-                        ))
+                        if match not in found_scripts:
+                            found_scripts.add(match)
+                            dependencies['scripts'].append((
+                                filename, match, line_num, line_clean, is_commented
+                            ))
                 
-                # Extract CTL file references
+                # Extract CTL file references - use set to prevent duplicates per line
+                found_ctl_files = set()
                 for pattern in self.patterns['ctl_file']:
                     matches = re.findall(pattern, line_clean, re.IGNORECASE)
                     for match in matches:
-                        dependencies['ctl_files'].append((
-                            filename, match, line_num, line_clean, is_commented
-                        ))
+                        if match not in found_ctl_files:
+                            found_ctl_files.add(match)
+                            dependencies['ctl_files'].append((
+                                filename, match, line_num, line_clean, is_commented
+                            ))
                 
-                # Extract PL/SQL calls
+                # Extract PL/SQL calls - use set to prevent duplicates per line
+                found_plsql_calls = set()
                 for pattern in self.patterns['plsql_call']:
                     matches = re.findall(pattern, line_clean, re.IGNORECASE)
                     for match in matches:
-                        if '.' in match:
+                        if '.' in match and match not in found_plsql_calls:
+                            found_plsql_calls.add(match)
                             parts = match.split('.')
                             if len(parts) >= 2:
                                 if len(parts) == 2:
@@ -310,7 +327,7 @@ class KSHAnalyzer:
         cursor.execute('''
             SELECT target_script, dependency_type, line_number, context, is_commented
             FROM dependencies
-            WHERE source_script = ?
+            WHERE source_script = ? AND is_commented = 0
             ORDER BY line_number
         ''', (script_name,))
         
@@ -328,7 +345,7 @@ class KSHAnalyzer:
         cursor.execute('''
             SELECT procedure_name, schema_name, package_name, line_number, context, is_commented
             FROM plsql_calls
-            WHERE source_script = ?
+            WHERE source_script = ? AND is_commented = 0
             ORDER BY line_number
         ''', (script_name,))
         
@@ -354,7 +371,7 @@ class KSHAnalyzer:
         cursor.execute('''
             SELECT source_script, dependency_type, line_number, context, is_commented
             FROM dependencies
-            WHERE target_script = ?
+            WHERE target_script = ? AND is_commented = 0
             ORDER BY source_script, line_number
         ''', (script_name,))
         
@@ -394,10 +411,10 @@ class KSHAnalyzer:
         return ctl_files
     
     def search_plsql_procedure(self, search_term: str) -> List[Dict]:
-        """Search for scripts that call a specific PL/SQL procedure
+        """Enhanced search for scripts that call PL/SQL procedures
         
         Args:
-            search_term: The procedure name to search for (can be partial)
+            search_term: The procedure name to search for (can be partial, like 'attempt_recovery')
             
         Returns:
             List of dictionaries containing calling scripts and details
@@ -405,35 +422,93 @@ class KSHAnalyzer:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Search in procedure_name, schema_name, or package_name
+        # Enhanced search patterns for better partial matching
         search_pattern = f"%{search_term}%"
+        exact_pattern = search_term.lower()
         
+        # Multiple search strategies for better results
         cursor.execute('''
             SELECT source_script, procedure_name, schema_name, package_name, 
                    line_number, context, is_commented
             FROM plsql_calls
-            WHERE LOWER(procedure_name) LIKE LOWER(?)
-               OR LOWER(schema_name) LIKE LOWER(?)
-               OR LOWER(package_name) LIKE LOWER(?)
-               OR LOWER(schema_name || '.' || package_name || '.' || procedure_name) LIKE LOWER(?)
-            ORDER BY source_script, line_number
-        ''', (search_pattern, search_pattern, search_pattern, search_pattern))
+            WHERE 
+                -- Exact procedure name match (highest priority)
+                LOWER(procedure_name) = ?
+                OR LOWER(procedure_name) LIKE ?
+                -- Schema name match
+                OR LOWER(schema_name) LIKE ?
+                -- Package name match
+                OR LOWER(package_name) LIKE ?
+                -- Full qualified name match (schema.package.procedure)
+                OR LOWER(COALESCE(schema_name, '') || '.' || COALESCE(package_name, '') || '.' || procedure_name) LIKE ?
+                -- Context search (for procedures mentioned in comments or strings)
+                OR LOWER(context) LIKE ?
+            ORDER BY 
+                -- Prioritize exact matches first
+                CASE WHEN LOWER(procedure_name) = ? THEN 1
+                     WHEN LOWER(procedure_name) LIKE ? THEN 2
+                     WHEN LOWER(package_name) LIKE ? THEN 3
+                     WHEN LOWER(schema_name) LIKE ? THEN 4
+                     ELSE 5 END,
+                source_script, line_number
+        ''', (exact_pattern, search_pattern, search_pattern, search_pattern, 
+              search_pattern, search_pattern, exact_pattern, search_pattern, 
+              search_pattern, search_pattern))
         
         results = []
         for row in cursor.fetchall():
+            # Build proper full procedure name with null handling
+            schema = row[2] or ''
+            package = row[3] or ''
+            procedure = row[1] or ''
+            
+            # Create full procedure name based on available components
+            if schema and package:
+                full_procedure = f"{schema}.{package}.{procedure}"
+            elif package:
+                full_procedure = f"{package}.{procedure}"
+            else:
+                full_procedure = procedure
+            
             results.append({
                 'source_script': row[0],
-                'procedure_name': row[1],
-                'schema_name': row[2],
-                'package_name': row[3],
-                'full_procedure': f"{row[2]}.{row[3]}.{row[1]}",
+                'procedure_name': procedure,
+                'schema_name': schema,
+                'package_name': package,
+                'full_procedure': full_procedure,
                 'line_number': row[4],
                 'context': row[5],
-                'is_commented': bool(row[6])
+                'is_commented': bool(row[6]),
+                'match_quality': self._get_match_quality(search_term, procedure, package, schema)
             })
         
         conn.close()
-        return results
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_results = []
+        for result in results:
+            key = (result['source_script'], result['line_number'], result['full_procedure'])
+            if key not in seen:
+                seen.add(key)
+                unique_results.append(result)
+        
+        return unique_results
+    
+    def _get_match_quality(self, search_term: str, procedure: str, package: str, schema: str) -> str:
+        """Determine the quality of the match for sorting purposes"""
+        search_lower = search_term.lower()
+        
+        if procedure.lower() == search_lower:
+            return "exact_procedure"
+        elif procedure.lower().find(search_lower) != -1:
+            return "partial_procedure"
+        elif package and package.lower().find(search_lower) != -1:
+            return "package_match"
+        elif schema and schema.lower().find(search_lower) != -1:
+            return "schema_match"
+        else:
+            return "context_match"
     
     def get_all_plsql_procedures(self) -> List[Dict]:
         """Get list of all unique PL/SQL procedures found in scripts"""
@@ -460,6 +535,30 @@ class KSHAnalyzer:
         
         conn.close()
         return procedures
+    
+    def cleanup_duplicate_plsql_calls(self):
+        """Remove duplicate PL/SQL calls from database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Remove duplicates by keeping only the first occurrence of each unique combination
+        cursor.execute('''
+            DELETE FROM plsql_calls 
+            WHERE id NOT IN (
+                SELECT MIN(id) 
+                FROM plsql_calls 
+                GROUP BY source_script, procedure_name, schema_name, package_name, line_number
+            )
+        ''')
+        
+        duplicates_removed = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        if duplicates_removed > 0:
+            self.logger.info(f"Removed {duplicates_removed} duplicate PL/SQL call entries")
+        
+        return duplicates_removed
     
     def get_plsql_procedure_callers(self, procedure_name: str) -> List[Dict]:
         """Get all scripts that call a specific PL/SQL procedure (exact match)
@@ -507,6 +606,63 @@ class KSHAnalyzer:
         
         conn.close()
         return results
+    
+    def save_directory_paths(self, ksh_dir: str, ctl_dir: str):
+        """Save directory paths to database for persistence"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        import datetime
+        timestamp = datetime.datetime.now().isoformat()
+        
+        # Save KSH directory
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_settings 
+            (setting_name, setting_value, last_updated)
+            VALUES (?, ?, ?)
+        ''', ('ksh_directory', ksh_dir, timestamp))
+        
+        # Save CTL directory
+        cursor.execute('''
+            INSERT OR REPLACE INTO user_settings 
+            (setting_name, setting_value, last_updated)
+            VALUES (?, ?, ?)
+        ''', ('ctl_directory', ctl_dir, timestamp))
+        
+        conn.commit()
+        conn.close()
+        
+        self.logger.info(f"Saved directory paths: KSH={ksh_dir}, CTL={ctl_dir}")
+    
+    def load_directory_paths(self) -> tuple:
+        """Load saved directory paths from database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute('''
+                SELECT setting_value FROM user_settings 
+                WHERE setting_name = ?
+            ''', ('ksh_directory',))
+            ksh_result = cursor.fetchone()
+            ksh_dir = ksh_result[0] if ksh_result else ""
+            
+            cursor.execute('''
+                SELECT setting_value FROM user_settings 
+                WHERE setting_name = ?
+            ''', ('ctl_directory',))
+            ctl_result = cursor.fetchone()
+            ctl_dir = ctl_result[0] if ctl_result else ""
+            
+            conn.close()
+            
+            self.logger.info(f"Loaded directory paths: KSH={ksh_dir}, CTL={ctl_dir}")
+            return ksh_dir, ctl_dir
+            
+        except Exception as e:
+            self.logger.error(f"Error loading directory paths: {e}")
+            conn.close()
+            return "", ""
     
     def export_dependencies(self, output_file: str, format: str = 'json'):
         """Export dependencies to various formats"""
