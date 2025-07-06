@@ -152,7 +152,7 @@ class KSHAnalyzerGUI:
         left_frame.grid_rowconfigure(0, weight=1)
         left_frame.grid_columnconfigure(0, weight=1)
         
-        # Script tree
+        # Script tree with enhanced search support
         self.script_tree = ttk.Treeview(left_frame, columns=('type', 'count'), show='tree headings')
         self.script_tree.heading('#0', text='File')
         self.script_tree.heading('type', text='Type')
@@ -160,6 +160,10 @@ class KSHAnalyzerGUI:
         self.script_tree.column('#0', width=200)
         self.script_tree.column('type', width=60)
         self.script_tree.column('count', width=80)
+        
+        # Configure treeview tags for search highlighting
+        self.script_tree.tag_configure('matched', background='lightyellow', foreground='black')
+        self.script_tree.tag_configure('normal', background='white', foreground='black')
         
         # Scrollbars for script tree
         script_scrollbar_v = ttk.Scrollbar(left_frame, orient=tk.VERTICAL, command=self.script_tree.yview)
@@ -187,6 +191,10 @@ class KSHAnalyzerGUI:
         self.search_entry = ttk.Entry(search_frame, textvariable=self.search_var)
         self.search_entry.grid(row=0, column=1, sticky=(tk.W, tk.E))
         self.search_entry.bind('<KeyRelease>', self.on_search)
+        self.search_entry.bind('<Return>', self.on_search)
+        
+        # Add clear button for script search
+        ttk.Button(search_frame, text="✗", command=self.clear_script_search).grid(row=0, column=2, padx=(2, 0))
         
         # Global PL/SQL search box
         plsql_search_frame = ttk.Frame(left_frame)
@@ -197,10 +205,17 @@ class KSHAnalyzerGUI:
         self.global_plsql_search_var = tk.StringVar()
         self.global_plsql_search_entry = ttk.Entry(plsql_search_frame, textvariable=self.global_plsql_search_var)
         self.global_plsql_search_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(0, 5))
-        self.global_plsql_search_entry.bind('<KeyRelease>', self.on_global_plsql_search)
+        # Make PL/SQL search truly dynamic with delayed execution
+        self.global_plsql_search_entry.bind('<KeyRelease>', self._delayed_plsql_search)
         self.global_plsql_search_entry.bind('<Return>', self.on_global_plsql_search)
         
-        ttk.Button(plsql_search_frame, text="Search", command=self.on_global_plsql_search).grid(row=0, column=2)
+        # Add timer for delayed search
+        self._plsql_search_timer = None
+
+        ttk.Button(plsql_search_frame, text="🔍", command=self.on_global_plsql_search).grid(row=0, column=2)
+        
+        # Add clear button for PL/SQL search
+        ttk.Button(plsql_search_frame, text="✗", command=self.clear_global_plsql_search).grid(row=0, column=3, padx=(2, 0))
         
         # Right panel - Dependency View
         right_frame = ttk.LabelFrame(middle_frame, text="Dependency View", padding="5")
@@ -1155,19 +1170,39 @@ class KSHAnalyzerGUI:
         # Store all elements for drag operations
         self.canvas_objects.update(elements)
         
-    def on_search(self, event):
-        """Handle search functionality"""
-        search_term = self.search_var.get().lower()
+    def on_search(self, event=None):
+        """Handle dynamic KSH script search functionality"""
+        search_term = self.search_var.get().strip().lower()
         
         if not search_term:
-            # Show all items
-            for item in self.script_tree.get_children():
-                self._show_tree_item(item)
+            # Show all items and clear highlights
+            self._restore_all_items()
             return
-            
-        # Filter items
+        
+        # Dynamic filtering with highlighting
+        matched_count = 0
+        all_items = self._get_all_tree_items()
+        
+        # Store original structure for restoration
+        if not hasattr(self, '_original_tree_structure'):
+            self._store_original_tree_structure()
+        
+        # Clear current tree
         for item in self.script_tree.get_children():
-            self._filter_tree_item(item, search_term)
+            self.script_tree.delete(item)
+        
+        # Rebuild tree with only matching items
+        for item_data in all_items:
+            if self._item_matches_search(item_data, search_term):
+                self._add_matching_item(item_data, search_term)
+                matched_count += 1
+        
+        # Auto-select if single match
+        if matched_count == 1:
+            items = self.script_tree.get_children()
+            if items:
+                self.script_tree.selection_set(items[0])
+                self.script_tree.focus(items[0])
             
     def _show_tree_item(self, item):
         """Show tree item and its children"""
@@ -1175,22 +1210,89 @@ class KSHAnalyzerGUI:
         for child in self.script_tree.get_children(item):
             self._show_tree_item(child)
             
-    def _filter_tree_item(self, item, search_term):
-        """Filter tree items based on search term"""
-        text = self.script_tree.item(item, 'text').lower()
-        
-        if search_term in text:
-            self.script_tree.item(item, tags=())
-            # Show parent if child matches
-            parent = self.script_tree.parent(item)
-            if parent:
-                self.script_tree.item(parent, tags=())
-        else:
-            self.script_tree.item(item, tags=('hidden',))
+    def _get_all_tree_items(self):
+        """Get all tree items with their data"""
+        if not hasattr(self, '_all_tree_items'):
+            self._all_tree_items = []
             
-        # Check children
+        # If we have stored items, return them
+        if self._all_tree_items:
+            return self._all_tree_items
+            
+        # Otherwise, collect from current tree
+        items = []
+        for item in self.script_tree.get_children():
+            items.extend(self._collect_item_data(item))
+        return items
+    
+    def _collect_item_data(self, item):
+        """Recursively collect item data"""
+        items = []
+        text = self.script_tree.item(item, 'text')
+        values = self.script_tree.item(item, 'values')
+        
+        items.append({
+            'text': text,
+            'values': values,
+            'parent': None,
+            'children': []
+        })
+        
+        # Collect children
         for child in self.script_tree.get_children(item):
-            self._filter_tree_item(child, search_term)
+            child_items = self._collect_item_data(child)
+            items.extend(child_items)
+        
+        return items
+    
+    def _store_original_tree_structure(self):
+        """Store the original tree structure for restoration"""
+        self._original_tree_structure = []
+        for item in self.script_tree.get_children():
+            self._original_tree_structure.extend(self._collect_item_data(item))
+    
+    def _item_matches_search(self, item_data, search_term):
+        """Check if item matches search term"""
+        text = item_data['text'].lower()
+        values_text = ' '.join(str(v).lower() for v in item_data['values'])
+        all_text = f"{text} {values_text}"
+        return search_term in all_text
+    
+    def _add_matching_item(self, item_data, search_term):
+        """Add matching item to tree with highlighting"""
+        text = item_data['text']
+        values = item_data['values']
+        
+        # Add item with highlighting if it contains search term
+        if search_term in text.lower():
+            tag = 'matched'
+        else:
+            tag = 'normal'
+            
+        self.script_tree.insert('', 'end', text=text, values=values, tags=(tag,))
+    
+    def _restore_all_items(self):
+        """Restore all original items"""
+        # Clear current tree
+        for item in self.script_tree.get_children():
+            self.script_tree.delete(item)
+        
+        # Restore from original structure if available
+        if hasattr(self, '_original_tree_structure'):
+            for item_data in self._original_tree_structure:
+                self.script_tree.insert('', 'end', 
+                                      text=item_data['text'], 
+                                      values=item_data['values'], 
+                                      tags=('normal',))
+        else:
+            # Fallback: refresh the data
+            if hasattr(self, 'analyzer') and self.ksh_dir.get():
+                self.scan_dependencies()
+    
+    def clear_script_search(self):
+        """Clear script search and restore all items"""
+        self.search_var.set("")
+        self._restore_all_items()
             
     def zoom_in(self):
         """Zoom in visualization"""
@@ -1659,8 +1761,17 @@ Database File: {self.analyzer.db_path}"""
         except Exception as e:
             self.plsql_status_label.config(text=f"Search error: {e}")
             
+    def _delayed_plsql_search(self, event=None):
+        """Handle delayed PL/SQL search for dynamic filtering"""
+        # Cancel previous timer
+        if self._plsql_search_timer:
+            self.root.after_cancel(self._plsql_search_timer)
+        
+        # Set new timer for 300ms delay
+        self._plsql_search_timer = self.root.after(300, self.on_global_plsql_search)
+    
     def on_global_plsql_search(self, event=None):
-        """Handle global PL/SQL procedure search"""
+        """Handle enhanced global PL/SQL procedure search with function-name-only capability"""
         search_term = self.global_plsql_search_var.get().strip()
         
         # Clear existing results
@@ -1670,14 +1781,14 @@ Database File: {self.analyzer.db_path}"""
         if not search_term:
             self.global_plsql_status_label.config(text="Use PL/SQL search box above to find procedures across all scripts")
             return
-            
-        if len(search_term) < 2:
-            self.global_plsql_status_label.config(text="Search term must be at least 2 characters")
+        
+        # Allow single character searches for more dynamic experience
+        if len(search_term) < 1:
             return
             
         try:
-            # Search for procedures across all scripts
-            results = self.analyzer.search_plsql_procedure(search_term)
+            # Enhanced search with function-name-only capability
+            results = self.analyzer.search_plsql_procedure_enhanced(search_term)
             
             if not results:
                 self.global_plsql_status_label.config(text=f"No PL/SQL procedures found matching '{search_term}' across all scripts")
@@ -1691,10 +1802,12 @@ Database File: {self.analyzer.db_path}"""
                 full_procedure = result['full_procedure']
                 match_quality = result.get('match_quality', 'unknown')
                 
-                # Format match quality for display
+                # Enhanced format match quality for display including function-name matches
                 quality_display = {
-                    'exact_procedure': '🎯 Exact',
-                    'partial_procedure': '📝 Partial',
+                    'exact_procedure': '🎯 Exact Procedure',
+                    'exact_function_name': '🎯 Exact Function',
+                    'partial_procedure': '📝 Partial Procedure',
+                    'partial_function_name': '📝 Partial Function',
                     'package_match': '📦 Package',
                     'schema_match': '🏢 Schema',
                     'context_match': '📄 Context',

@@ -583,6 +583,126 @@ class KSHAnalyzer:
         
         return duplicates_removed
     
+    def search_plsql_procedure_enhanced(self, search_term: str) -> List[Dict]:
+        """Enhanced PL/SQL procedure search with function-name-only capability
+        
+        Args:
+            search_term: The procedure name to search for (function name only, or full qualified name)
+            
+        Returns:
+            List of dictionaries containing calling scripts and details with better matching
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Enhanced search patterns for function-name-only searches
+        search_pattern = f"%{search_term}%"
+        exact_pattern = search_term.lower()
+        
+        # Enhanced query with better function name matching
+        cursor.execute('''
+            SELECT source_script, procedure_name, schema_name, package_name, 
+                   line_number, context, is_commented
+            FROM plsql_calls
+            WHERE 
+                -- Exact procedure name match (highest priority for function name only)
+                LOWER(procedure_name) = ?
+                OR LOWER(procedure_name) LIKE ?
+                -- Extract function name from qualified calls (e.g., pkg.func_name)
+                OR LOWER(SUBSTR(procedure_name, INSTR(procedure_name, '.') + 1)) = ?
+                OR LOWER(SUBSTR(procedure_name, INSTR(procedure_name, '.') + 1)) LIKE ?
+                -- Schema name match
+                OR LOWER(schema_name) LIKE ?
+                -- Package name match  
+                OR LOWER(package_name) LIKE ?
+                -- Full qualified name match (schema.package.procedure)
+                OR LOWER(COALESCE(schema_name, '') || '.' || COALESCE(package_name, '') || '.' || procedure_name) LIKE ?
+                -- Context search (for procedures mentioned in comments or strings)
+                OR LOWER(context) LIKE ?
+            ORDER BY 
+                -- Prioritize exact function name matches first
+                CASE WHEN LOWER(procedure_name) = ? THEN 1
+                     WHEN LOWER(SUBSTR(procedure_name, INSTR(procedure_name, '.') + 1)) = ? THEN 2
+                     WHEN LOWER(procedure_name) LIKE ? THEN 3
+                     WHEN LOWER(SUBSTR(procedure_name, INSTR(procedure_name, '.') + 1)) LIKE ? THEN 4
+                     WHEN LOWER(package_name) LIKE ? THEN 5
+                     WHEN LOWER(schema_name) LIKE ? THEN 6
+                     ELSE 7 END,
+                source_script, line_number
+        ''', (exact_pattern, search_pattern, exact_pattern, search_pattern,
+              search_pattern, search_pattern, search_pattern, search_pattern,
+              exact_pattern, exact_pattern, search_pattern, search_pattern,
+              search_pattern, search_pattern))
+        
+        results = []
+        for row in cursor.fetchall():
+            # Build proper full procedure name with null handling
+            schema = row[2] or ''
+            package = row[3] or ''
+            procedure = row[1] or ''
+            
+            # Create full procedure name based on available components
+            if schema and package:
+                full_procedure = f"{schema}.{package}.{procedure}"
+            elif package:
+                full_procedure = f"{package}.{procedure}"
+            else:
+                full_procedure = procedure
+            
+            # Enhanced match quality for function-name searches
+            match_quality = self._get_enhanced_match_quality(search_term, procedure, package, schema)
+            
+            results.append({
+                'source_script': row[0],
+                'procedure_name': procedure,
+                'schema_name': schema,
+                'package_name': package,
+                'full_procedure': full_procedure,
+                'line_number': row[4],
+                'context': row[5],
+                'is_commented': bool(row[6]),
+                'match_quality': match_quality
+            })
+        
+        conn.close()
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_results = []
+        for result in results:
+            key = (result['source_script'], result['line_number'], result['full_procedure'])
+            if key not in seen:
+                seen.add(key)
+                unique_results.append(result)
+        
+        return unique_results
+    
+    def _get_enhanced_match_quality(self, search_term: str, procedure: str, package: str, schema: str) -> str:
+        """Enhanced match quality determination for function-name searches"""
+        search_lower = search_term.lower()
+        procedure_lower = procedure.lower()
+        
+        # Extract function name from qualified procedure names
+        if '.' in procedure:
+            function_part = procedure.split('.')[-1].lower()
+        else:
+            function_part = procedure_lower
+        
+        if procedure_lower == search_lower:
+            return "exact_procedure"
+        elif function_part == search_lower:
+            return "exact_function_name"
+        elif procedure_lower.find(search_lower) != -1:
+            return "partial_procedure"
+        elif function_part.find(search_lower) != -1:
+            return "partial_function_name"
+        elif package and package.lower().find(search_lower) != -1:
+            return "package_match"
+        elif schema and schema.lower().find(search_lower) != -1:
+            return "schema_match"
+        else:
+            return "context_match"
+
     def get_plsql_procedure_callers(self, procedure_name: str) -> List[Dict]:
         """Get all scripts that call a specific PL/SQL procedure (exact match)
         
