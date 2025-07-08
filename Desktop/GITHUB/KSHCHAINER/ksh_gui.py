@@ -14,6 +14,7 @@ import sqlite3
 import datetime
 import tempfile
 import subprocess
+import shutil
 from ksh_analyzer import KSHAnalyzer
 
 class KSHAnalyzerGUI:
@@ -136,6 +137,8 @@ class KSHAnalyzerGUI:
         
         ttk.Button(button_frame, text="🔍 Scan Dependencies", command=self.scan_dependencies).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(button_frame, text="📊 Export Results", command=self.export_dependencies).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame, text="📂 Copy Selected File", command=self.copy_selected_file).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Button(button_frame, text="💾 Load Data", command=self.load_existing_data).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(button_frame, text="🔄 Refresh", command=self.refresh_view).pack(side=tk.LEFT, padx=(0, 10))
         
     def create_middle_panel(self, parent):
@@ -400,7 +403,7 @@ class KSHAnalyzerGUI:
             self.ctl_dir.set(directory)
             
     def scan_dependencies(self):
-        """Scan for dependencies in background thread"""
+        """Scan for dependencies in background thread with path change detection"""
         if not self.ksh_dir.get():
             messagebox.showerror("Error", "Please select KSH scripts directory")
             return
@@ -408,6 +411,28 @@ class KSHAnalyzerGUI:
         if not self.ctl_dir.get():
             messagebox.showerror("Error", "Please select CTL files directory")
             return
+        
+        # Check if paths have changed
+        saved_ksh_dir, saved_ctl_dir = self.analyzer.load_directory_paths()
+        paths_changed = (self.ksh_dir.get() != saved_ksh_dir or self.ctl_dir.get() != saved_ctl_dir)
+        
+        if not paths_changed and self.has_existing_data():
+            # Ask user if they want to rescan or use existing data
+            result = messagebox.askyesnocancel(
+                "Existing Data Found",
+                "Directory paths haven't changed and existing data was found.\n\n"
+                "Do you want to:\n"
+                "• Yes: Re-scan directories (will take time)\n"
+                "• No: Load existing data (fast)\n"
+                "• Cancel: Do nothing"
+            )
+            
+            if result is None:  # Cancel
+                return
+            elif result is False:  # No - load existing data
+                self.load_existing_data()
+                return
+            # If Yes, continue with full scan
             
         # Start scanning in background thread
         self.progress.start()
@@ -2551,6 +2576,138 @@ Controls:
             return
             
         self.open_in_external_editor(self.current_script.get())
+    
+    def copy_selected_file(self):
+        """Copy selected KSH or CTL file to user-specified directory"""
+        selection = self.script_tree.selection()
+        if not selection:
+            messagebox.showwarning("No Selection", "Please select a KSH or CTL file to copy")
+            return
+            
+        item = selection[0]
+        script_name = self.script_tree.item(item, 'text')
+        file_type = self.script_tree.item(item, 'values')[0]
+        
+        # Skip folder items
+        if script_name.startswith('📁') or file_type == 'folder':
+            messagebox.showwarning("Invalid Selection", "Please select a KSH or CTL file, not a folder")
+            return
+        
+        # Get source file path
+        source_path = None
+        if file_type == 'ksh':
+            # Find the script file path
+            ksh_files = self.analyzer.scan_directory(self.ksh_dir.get(), ['.ksh', '.sh'])
+            for ksh_file in ksh_files:
+                if os.path.basename(ksh_file) == script_name:
+                    source_path = ksh_file
+                    break
+        elif file_type == 'ctl':
+            # Find the CTL file path
+            ctl_files = self.analyzer.scan_directory(self.ctl_dir.get(), ['.ctl'])
+            for ctl_file in ctl_files:
+                if os.path.basename(ctl_file) == script_name:
+                    source_path = ctl_file
+                    break
+        
+        if not source_path or not os.path.exists(source_path):
+            messagebox.showerror("Error", f"Could not find source file: {script_name}")
+            return
+        
+        # Ask user for destination directory
+        dest_dir = filedialog.askdirectory(
+            title=f"Select destination directory for {script_name}"
+        )
+        
+        if not dest_dir:
+            return  # User cancelled
+        
+        # Copy the file
+        try:
+            dest_path = os.path.join(dest_dir, script_name)
+            
+            # Check if file already exists
+            if os.path.exists(dest_path):
+                result = messagebox.askyesno(
+                    "File Exists",
+                    f"File '{script_name}' already exists in destination directory.\n\n"
+                    f"Do you want to overwrite it?"
+                )
+                if not result:
+                    return
+            
+            shutil.copy2(source_path, dest_path)
+            messagebox.showinfo(
+                "Success",
+                f"Successfully copied '{script_name}' to:\n{dest_path}"
+            )
+            
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to copy file: {e}")
+    
+    def has_existing_data(self):
+        """Check if database has existing data"""
+        try:
+            scripts = self.analyzer.get_all_scripts()
+            ctl_files = self.analyzer.get_all_ctl_files()
+            return len(scripts) > 0 or len(ctl_files) > 0
+        except:
+            return False
+    
+    def load_existing_data(self):
+        """Load existing data from database without re-scanning"""
+        try:
+            self.progress.start()
+            self.status_label.config(text="Loading existing data...")
+            
+            # Load saved directory paths
+            saved_ksh_dir, saved_ctl_dir = self.analyzer.load_directory_paths()
+            
+            if saved_ksh_dir:
+                self.ksh_dir.set(saved_ksh_dir)
+            if saved_ctl_dir:
+                self.ctl_dir.set(saved_ctl_dir)
+            
+            # Check if we have existing data
+            if not self.has_existing_data():
+                self.progress.stop()
+                messagebox.showwarning(
+                    "No Data",
+                    "No existing data found in database. Please scan directories first."
+                )
+                return
+            
+            # Create mock results for display
+            scripts = self.analyzer.get_all_scripts()
+            ctl_files = self.analyzer.get_all_ctl_files()
+            
+            ksh_results = {
+                'total_files': len(scripts),
+                'dependencies': {}  # Not needed for display
+            }
+            
+            ctl_results = {
+                'total_files': len(ctl_files),
+                'ctl_files': ctl_files
+            }
+            
+            # Update GUI
+            self.update_script_tree(ksh_results, ctl_results)
+            
+            self.progress.stop()
+            self.status_label.config(text=f"Data loaded | Scripts: {len(scripts)} | CTL Files: {len(ctl_files)}")
+            
+            messagebox.showinfo(
+                "Data Loaded",
+                f"Successfully loaded existing data:\n"
+                f"Scripts: {len(scripts)}\n"
+                f"CTL Files: {len(ctl_files)}"
+            )
+            
+        except Exception as e:
+            self.progress.stop()
+            self.status_label.config(text="Error loading data")
+            messagebox.showerror("Error", f"Failed to load existing data: {e}")
 
 
 def main():
